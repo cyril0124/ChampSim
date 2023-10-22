@@ -71,11 +71,31 @@ phase_stats do_phase(phase_info phase, environment& env, std::vector<tracereader
       abort();
     }
 
+
+    /*
+      这段代码将 operables 容器按照 leap_operation 成员进行升序排序。
+      原因在于 lambda 函数的比较操作：lhs.leap_operation < rhs.leap_operation。
+      这个操作检查左侧元素（lhs）的 leap_operation 是否小于右侧元素（rhs）的 leap_operation。
+      如果是，那么函数返回 true，意味着 lhs 应该在排序后的序列中位于 rhs 的前面。
+      这样，std::sort 函数就会按照 leap_operation 的值从小到大（即升序）对 operables 容器进行排序。
+    */
     std::sort(std::begin(operables), std::end(operables),
               [](const champsim::operable& lhs, const champsim::operable& rhs) { return lhs.leap_operation < rhs.leap_operation; });
 
     // Read from trace
+    /*
+      std::vector<std::reference_wrapper<O3_CPU>> cpu_view() override {
+        return {
+          std::ref(cpu0)
+        };
+      }
+    */
     for (O3_CPU& cpu : env.cpu_view()) {
+      /*
+        std::vector 的 at 方法用于访问向量中指定位置的元素。它接受一个参数，即元素的索引，返回该位置的元素的引用。
+        at 方法的一个特性是，如果提供的索引超出了向量的范围（即，索引大于或等于向量的大小），它会抛出一个 std::out_of_range 异常。
+        这与 operator[] 不同，operator[] 不会检查索引是否有效，如果提供的索引超出了向量的范围，它的行为是未定义的
+      */ 
       auto& trace = traces.at(trace_index.at(cpu.cpu));
       for (auto pkt_count = cpu.IN_QUEUE_SIZE - static_cast<long>(std::size(cpu.input_queue)); !trace.eof() && pkt_count > 0; --pkt_count)
         cpu.input_queue.push_back(trace());

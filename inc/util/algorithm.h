@@ -23,6 +23,13 @@
 
 namespace champsim
 {
+
+/*
+  这个 extract_if 模板函数执行了一个分割操作，它接受一个输入序列（由 begin 和 end 迭代器定义）
+  和一个输出序列（由 d_begin 迭代器定义），以及一个谓词函数 func。这个函数将输入序列中满足 func 
+  的元素移动到输出序列，而不满足 func 的元素则留在输入序列的开始部分。函数返回一个对包含两个迭代器
+  的 std::pair，这两个迭代器分别指向输入序列和输出序列中的下一个位置。
+*/
 template <typename InputIt, typename OutputIt, typename F>
 auto extract_if(InputIt begin, InputIt end, OutputIt d_begin, F func)
 {

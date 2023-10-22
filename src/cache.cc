@@ -79,13 +79,19 @@ CACHE::BLOCK::BLOCK(mshr_type mshr)
 {
 }
 
+// 接收下层传上来的块, 有可能需要使用替换算法选出一个 way 然后进行丢弃
+// ChampSim 的refill思路是: 
+//  出现 non-compulsory miss 的时候, 先不通过替换算法选择一个 way 进行 release, 
+//  而是先进行 refill, refill 的块上来的时候, 再通过替换算法选择一个 way 进行 writeback 操作
 bool CACHE::handle_fill(const mshr_type& fill_mshr)
 {
   cpu = fill_mshr.cpu;
 
   // find victim
+  // 注: “end”迭代器并不指向任何有效的元素，而是指向容器的末端，即最后一个元素的下一个位置。
   auto [set_begin, set_end] = get_set_span(fill_mshr.address);
   auto way = std::find_if_not(set_begin, set_end, [](auto x) { return x.valid; });
+  // way == set_end 说明所有的way都是valid的, 这时候需要用替换算法来选择victim way, 这里的way是CacheLine
   if (way == set_end)
     way = std::next(set_begin, impl_find_victim(fill_mshr.cpu, fill_mshr.instr_id, get_set_index(fill_mshr.address), &*set_begin, fill_mshr.ip,
                                                 fill_mshr.address, champsim::to_underlying(fill_mshr.type)));
@@ -102,9 +108,15 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
 
   bool success = true;
   auto metadata_thru = fill_mshr.pf_metadata;
+  // champsim::bitmask 相当于Verilog的切片:
+  //  wire [31:0] a; // 32位的线
+  //  wire [15:0] b; // 从a选择16位，对应的C++代码可能是 bitmask(16, 0)
+  //  b = a[15:0];
   auto pkt_address = (virtual_prefetch ? fill_mshr.v_address : fill_mshr.address) & ~champsim::bitmask(match_offset_bits ? 0 : OFFSET_BITS);
   if (way != set_end) {
+    // 这里执行的是dirty writeback操作
     if (way->valid && way->dirty) {
+      // 首先需要构建一个 packet
       request_type writeback_packet;
 
       writeback_packet.cpu = fill_mshr.cpu;
@@ -121,17 +133,18 @@ bool CACHE::handle_fill(const mshr_type& fill_mshr)
             __func__, writeback_packet.address, writeback_packet.v_address, fill_mshr.pf_metadata);
       }
 
+      // 将这个 packet 写入到下一层的 WQ 中
       success = lower_level->add_wq(writeback_packet);
     }
 
-    if (success) {
+    if (success) { // writeback 操作成功
       auto evicting_address = (ever_seen_data ? way->address : way->v_address) & ~champsim::bitmask(match_offset_bits ? 0 : OFFSET_BITS);
 
       if (way->prefetch)
-        ++sim_stats.pf_useless;
+        ++sim_stats.pf_useless; // 这里统计预取相关信息, 这个块如果是被预取上来的, 那么这时候就要标记为是一个useless的块
 
       if (fill_mshr.type == access_type::PREFETCH)
-        ++sim_stats.pf_fill;
+        ++sim_stats.pf_fill; // 表示回填的块是由预取造成的
 
       *way = BLOCK{fill_mshr};
 
@@ -238,6 +251,7 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
         ++sim_stats.pf_useful;
     }
 
+    // 请求的地址已经对应了一个 inflight 的 MSHR 了, 所以这里就需要进行 MSHR 的合并
     *mshr_entry = mshr_type::merge(*mshr_entry, to_allocate);
   } else {
     if (mshr_full) { // not enough MSHR resource
@@ -248,6 +262,7 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
       return false;  // TODO should we allow prefetches anyway if they will not be filled to this level?
     }
 
+    // 向下层发送请求
     request_type fwd_pkt;
 
     fwd_pkt.asid[0] = handle_pkt.asid[0];
@@ -263,10 +278,10 @@ bool CACHE::handle_miss(const tag_lookup_type& handle_pkt)
     fwd_pkt.ip = handle_pkt.ip;
 
     fwd_pkt.instr_depend_on_me = handle_pkt.instr_depend_on_me;
-    fwd_pkt.response_requested = (!handle_pkt.prefetch_from_this || !handle_pkt.skip_fill);
+    fwd_pkt.response_requested = (!handle_pkt.prefetch_from_this || !handle_pkt.skip_fill); // 对于一些请求可能不需要响应
 
     bool success;
-    if (prefetch_as_load || handle_pkt.type != access_type::PREFETCH)
+    if (prefetch_as_load || handle_pkt.type != access_type::PREFETCH) // 可以把 Prefetch 请求转化为普通的 Load 请求
       success = lower_level->add_rq(fwd_pkt);
     else
       success = lower_level->add_pq(fwd_pkt);
@@ -300,8 +315,10 @@ bool CACHE::handle_write(const tag_lookup_type& handle_pkt)
   }
 
   inflight_writes.emplace_back(handle_pkt, current_cycle);
+  // FILL_LATENCY 是提前定义好的
   inflight_writes.back().event_cycle = current_cycle + (warmup ? 0 : FILL_LATENCY);
-    
+
+  // 进入到这个函数说明发生了 miss
   ++sim_stats.misses[champsim::to_underlying(handle_pkt.type)][handle_pkt.cpu];
 
   return true;
@@ -332,11 +349,17 @@ long CACHE::operate()
 {
   long progress{0};
 
+  // 检查请求冲突
+  // upper_levels是上层的channel, 对于L2上层是L1
   for (auto ul : upper_levels)
     ul->check_collision();
 
   // Finish returns
+  // std::cbegin 和 std::cend 是 C++ 标准库中的两个函数，它们返回给定容器的常量迭代器（const iterator），这意味着通过这些迭代器不能修改容器中的元素。
+  // channel的returned是deque类型(FIFO)
+  // returned也可以叫做respond_queue, 里面都是那些处理完成准备响应的请求
   std::for_each(std::cbegin(lower_level->returned), std::cend(lower_level->returned), [this](const auto& pkt) { this->finish_packet(pkt); });
+  // std::distance 用于计算两个迭代器之间的距离——也就是两个迭代器之间的元素数量
   progress += std::distance(std::cbegin(lower_level->returned), std::cend(lower_level->returned));
   lower_level->returned.clear();
 
@@ -349,6 +372,7 @@ long CACHE::operate()
 
   // Perform fills
   auto fill_bw = MAX_FILL;
+  // 这里的两个 ref 是将 MSHR 和 inflight_write 两个队列的内容都处理了一遍, 也就是一个拼接的过程
   for (auto q : {std::ref(MSHR), std::ref(inflight_writes)}) {
     auto [fill_begin, fill_end] =
         champsim::get_span_p(std::cbegin(q.get()), std::cend(q.get()), fill_bw, [cycle = current_cycle](const auto& x) { return x.event_cycle <= cycle; });
@@ -359,10 +383,15 @@ long CACHE::operate()
   progress += MAX_FILL - fill_bw;
 
   // Initiate tag checks
+  // std::min 和 std::max 是 C++ 标准库中的两个函数，用于返回一组数中的最小值和最大值。
   auto tag_bw = std::max(0ll, std::min<long long>(static_cast<long long>(MAX_TAG), MAX_TAG * HIT_LATENCY - std::size(inflight_tag_check)));
   auto can_translate = [avail = (std::size(translation_stash) < static_cast<std::size_t>(MSHR_SIZE))](const auto& entry) {
     return avail || entry.is_translated;
   };
+  // std::transform 是C++标准库中的一个算法，它可以对序列中的元素执行某种操作，并将结果存入另一个序列中。
+  // std::back_inserter 用于创建一个向容器的末尾插入元素的插入迭代器（insert iterator）
+  // 这里需要做的操作是, 将那些需要转换地址的请求从 translation_stash 中找出来, 再插入到 inflight_tag_check 中, 在进行搬运的时候, 会同时对每个元素执行一个 initiate_tag_check 函数
+  // tag_bw 用于限制每次能够最多同时处理的请求数量, 是一种带宽限制, 这要做能够更好地模拟处理器中的真实行为
   auto stash_bandwidth_consumed = champsim::transform_while_n(
       translation_stash, std::back_inserter(inflight_tag_check), tag_bw, [](const auto& entry) { return entry.is_translated; }, initiate_tag_check<false>());
   tag_bw -= stash_bandwidth_consumed;
@@ -370,20 +399,25 @@ long CACHE::operate()
   std::vector<long long> channels_bandwidth_consumed{};
   for (auto* ul : upper_levels) {
     for (auto q : {std::ref(ul->WQ), std::ref(ul->RQ), std::ref(ul->PQ)}) {
+      // 从各个 Queue 中接收请求放到 inflight_tag_check 中, 准备进行 Cache 的访问
       auto bandwidth_consumed = champsim::transform_while_n(q.get(), std::back_inserter(inflight_tag_check), tag_bw, can_translate, initiate_tag_check<true>(ul));
       channels_bandwidth_consumed.push_back(bandwidth_consumed);
       tag_bw -= bandwidth_consumed;
       progress += bandwidth_consumed;
     }
   }
+
+  // 内部的预取 Queue
   auto pq_bandwidth_consumed = champsim::transform_while_n(internal_PQ, std::back_inserter(inflight_tag_check), tag_bw, can_translate, initiate_tag_check<false>());
   tag_bw -= pq_bandwidth_consumed;
   progress += pq_bandwidth_consumed;
 
   // Issue translations
+  // 进行地址转换, 会转发请求给TLB
   issue_translation();
 
   // Find entries that would be ready except that they have not finished translation, move them to the stash
+  // 如果还没完成地址转换, 就把那个 entry 放到 translation_stash 中
   auto [last_not_missed, stash_end] =
       champsim::extract_if(std::begin(inflight_tag_check), std::end(inflight_tag_check), std::back_inserter(translation_stash),
                            [cycle = current_cycle](const auto& x) { return x.event_cycle < cycle && !x.is_translated; });
@@ -394,11 +428,14 @@ long CACHE::operate()
   auto do_tag_check = [this](const auto& pkt) {
     if (this->try_hit(pkt))
       return true;
+    // 下面是处理 miss 的情况
     if (pkt.type == access_type::WRITE && !this->match_offset_bits)
       return this->handle_write(pkt); // Treat writes (that is, writebacks) like fills
     else
       return this->handle_miss(pkt); // Treat writes (that is, stores) like reads
   };
+  
+  // 只有经过地址转换后的才能进行 tag 检查
   auto [tag_check_ready_begin, tag_check_ready_end] =
       champsim::get_span_p(std::begin(inflight_tag_check), std::end(inflight_tag_check), MAX_TAG,
                            [cycle = current_cycle](const auto& pkt) { return pkt.event_cycle <= cycle && pkt.is_translated; });
@@ -498,8 +535,13 @@ int CACHE::prefetch_line(uint64_t, uint64_t, uint64_t pf_addr, bool fill_this_le
 void CACHE::finish_packet(const response_type& packet)
 {
   // check MSHR information
+  // 寻找地址匹配的 MSHR 项
   auto mshr_entry = std::find_if(std::begin(MSHR), std::end(MSHR),
                                  [match = packet.address >> OFFSET_BITS, shamt = OFFSET_BITS](const auto& entry) { return (entry.address >> shamt) == match; });
+  // MSHR是一个deque
+  // std::find_if 用于在一个范围内查找满足特定条件的第一个元素
+  // std::numeric_limits<uint64_t>::max() 用于寻找uint64_t数据类型的最大值
+  // 这里主要是在 MSHR 容器中寻找第一个 event_cycle 等于 uint64_t 类型最大值的元素，并返回其迭代器
   auto first_unreturned = std::find_if(MSHR.begin(), MSHR.end(), [](auto x) { return x.event_cycle == std::numeric_limits<uint64_t>::max(); });
 
   // sanity check
@@ -511,8 +553,18 @@ void CACHE::finish_packet(const response_type& packet)
   // MSHR holds the most updated information about this request
   mshr_entry->data = packet.data;
   mshr_entry->pf_metadata = packet.pf_metadata;
+  // FILL_LATENCY 是这个数据从下层到上层的LATENCY值, 单位是cycle
   mshr_entry->event_cycle = current_cycle + (warmup ? 0 : FILL_LATENCY);
 
+  /* 下面的代码等价于C语言的:
+    #ifdef DEBUG_PRINT
+      printf("[%s_MSHR] %s instr_id: %d address: %llx data: %llx type: %s to_finish: %lu event: %llu current: %llu\n", 
+          NAME, __func__, mshr_entry->instr_id,
+          mshr_entry->address, mshr_entry->data, access_type_names[champsim_to_underlying(mshr_entry->type)], 
+          lower_level->returned_size, // 假设这是一个已知的值
+          mshr_entry->event_cycle, current_cycle);
+    #endif
+  */
   if constexpr (champsim::debug_print) {
     fmt::print("[{}_MSHR] {} instr_id: {} address: {:#x} data: {:#x} type: {} to_finish: {} event: {} current: {}\n", NAME, __func__, mshr_entry->instr_id,
                mshr_entry->address, mshr_entry->data, access_type_names.at(champsim::to_underlying(mshr_entry->type)), std::size(lower_level->returned),
@@ -521,14 +573,17 @@ void CACHE::finish_packet(const response_type& packet)
 
   // Order this entry after previously-returned entries, but before non-returned
   // entries
+  // std::iter_swap 用于交换两个迭代器所指向的元素
   std::iter_swap(mshr_entry, first_unreturned);
 }
 
 void CACHE::finish_translation(const response_type& packet)
 {
+  // 定义一个匹配函数
   auto matches_vpage = [page_num = packet.v_address >> LOG2_PAGE_SIZE](const auto& entry) {
     return (entry.v_address >> LOG2_PAGE_SIZE) == page_num;
   };
+  // 定义一个标记地址已经被翻译的函数
   auto mark_translated = [p_page = packet.data, this](auto& entry) {
     entry.address = champsim::splice_bits(p_page, entry.v_address, LOG2_PAGE_SIZE); // translated address
     entry.is_translated = true;                                                     // This entry is now translated
@@ -539,7 +594,14 @@ void CACHE::finish_translation(const response_type& packet)
   };
 
   // Restart stashed translations
+  // 这两行代码将 translation_stash 分为三部分：
+  //  (1) 在 std::begin(translation_stash) 和 finish_begin 之间的部分包含已经被翻译的条目
+  //  (2) 在 finish_begin 和 finish_end 之间的部分包含未被翻译但与虚拟页面匹配的条目
+  //  (3) 在 finish_end 和 std::end(translation_stash) 之间的部分包含未被翻译且不与虚拟页面匹配的条目
+  // translation_stash 这个容器存储了一些等待翻译的条目
+  // std::find_if_not 在一个范围内查找第一个不满足特定条件的元素
   auto finish_begin = std::find_if_not(std::begin(translation_stash), std::end(translation_stash), [](const auto& x) { return x.is_translated; });
+  // std::stable_partition 对一个范围内的元素进行排序，使所有满足特定条件的元素都出现在不满足条件的元素之前，同时保持它们原有的相对顺序
   auto finish_end = std::stable_partition(finish_begin, std::end(translation_stash), matches_vpage);
   std::for_each(finish_begin, finish_end, mark_translated);
 
